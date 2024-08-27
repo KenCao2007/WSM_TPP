@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-from transformer.Layers import EncoderLayer
-from transformer.torch_basemodel import TorchBaseModel
 import torch.nn.functional as F
 from transformer import Constants
 import math
@@ -100,13 +98,6 @@ class EncoderLayer(nn.Module):
         self.d_model = d_model
 
     def forward(self, x_q, x_kv, mask):
-        # if self.use_residual:
-        #     x = self.sublayer[0](x, lambda x: self.self_attn(x_q, x_kv, x_kv, mask))
-        #     if self.feed_forward is not None:
-        #         return self.sublayer[1](x, self.feed_forward)
-        #     else:
-        #         return x
-        # else:
         return self.self_attn(x_q, x_kv, x_kv, mask)
 
 class MultiHeadAttention(nn.Module):
@@ -119,7 +110,6 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.output_linear = output_linear
 
-        # self.v_linear = nn.Linear(d_input, d_model)
 
         if output_linear:
             self.linears = nn.ModuleList(
@@ -133,13 +123,10 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
-        # print(query.shape, key.shape, value.shape, 'before')
         query, key, value = [
             lin_layer(x).view(nbatches, -1, self.n_head, self.d_k).transpose(1, 2)
             for lin_layer, x in zip(self.linears, (query, key, value))
         ]
-
-        # value = self.v_linear(value).view(nbatches, -1, self.n_head, self.d_k).transpose(1, 2)
 
         x, attn_weight = attention(query, key, value, mask=mask, dropout=self.dropout)
 
@@ -168,311 +155,6 @@ def attention(query, key, value, mask=None, dropout=None):
         p_attn = dropout(p_attn)
     return torch.matmul(p_attn, value), p_attn
 
-class mle_SAHP(nn.Module):
-    """Torch implementation of Self-Attentive Hawkes Process, ICML 2020.
-    Part of the code is collected from https://github.com/yangalan123/anhp-andtt/blob/master/sahp
-
-    I slightly modify the original code because it is not stable.
-
-    """
-
-    def __init__(self, model_config):
-        """Initialize the model
-
-        Args:
-            model_config (EasyTPP.ModelConfig): config of model specs.
-        """
-        super().__init__()
-        self.d_model = model_config.d_model
-        self.d_time = model_config.d_model
-        self.num_types = model_config.num_types
-        self.d_inner = model_config.d_inner_hid
-        self.use_norm = False
-
-        # position vector, used for temporal encoding
-        self.layer_position_emb = TimeShiftedPositionalEncoding(d_model=self.d_model)
-        # self.layer_position_emb = self.temporal_enc# (d_model=self.d_model)
-
-        self.n_layers = model_config.n_layers
-        self.n_head = model_config.n_head
-        self.dropout = model_config.dropout 
-
-        # convert hidden vectors into a scalar
-        self.layer_intensity_hidden = nn.Linear(self.d_model, self.num_types)
-        self.softplus = nn.Softplus()
-
-
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.d_model)
-
-        # Equation (12): mu
-        self.mu = nn.Sequential(
-            nn.Linear(self.d_model, self.num_types),
-            # nn.GELU()
-            )
-        #nn.Parameter(torch.empty([self.d_model, self.num_types])).to('cuda')
-        # Equation (13): eta
-        self.eta = nn.Sequential(
-            nn.Linear(self.d_model, self.num_types),
-            # nn.GELU()
-            )
-        # Equation (14): gamma
-        self.gamma = nn.Sequential(
-            nn.Linear(self.d_model, self.num_types),
-            # nn.Softplus()
-            )
-        
-        nn.init.xavier_normal_(self.mu[0].weight)
-        nn.init.xavier_normal_(self.eta[0].weight)
-        nn.init.xavier_normal_(self.gamma[0].weight)
-
-        self.layer_type_emb = nn.Embedding(self.num_types+1,  # have padding
-                                           self.d_model,
-                                           padding_idx=Constants.PAD)
-
-        self.eps = torch.finfo(torch.float32).eps
-        self.encoder = EncoderLayer(
-                self.d_model,
-                MultiHeadAttention(self.n_head, self.d_model, self.d_model, self.dropout,
-                                   output_linear=False),
-
-                use_residual=False,
-                dropout=self.dropout
-            )
-
-        # self.position_vec = torch.tensor(
-        #     [math.pow(10000.0, 2.0 * (i // 2) / self.d_model) for i in range(self.d_model)],
-        #     device=torch.device('cuda'))
-        
-    def temporal_enc(self, time, non_pad_mask):
-        """
-        Input: batch*seq_len.
-        Output: batch*seq_len*d_model.
-        """
-        
-        result = time.unsqueeze(-1) / self.position_vec
-        returned = torch.zeros_like(result)
-        returned[:, :, 0::2] = torch.sin(result[:, :, 0::2])
-        returned[:, :, 1::2] = torch.cos(result[:, :, 1::2])
-        return returned * non_pad_mask
-    
-    def compute_intensity(self, batch, opt):
-        type_seqs, time_seqs, time_delta_seqs= batch
-        type_seqs = type_seqs.long()
-        _, enc_out = self.forward(type_seqs, time_seqs, time_delta_seqs, opt)
-
-        cell_t = self.state_decay(encode_state=enc_out,
-                                  duration_t=time_delta_seqs[:, :, None])
-
-        # [batch_size, seq_len, num_event_types]
-        lambda_at_event = self.softplus(cell_t)
-        return lambda_at_event
-    # def state_decay(self, encode_state, mu, eta, gamma, duration_t):
-    def state_decay(self, encode_state, duration_t):
-        """Equation (15), which computes the pre-intensity states
-
-        Args:
-            encode_state (tensor): [batch_size, seq_len, hidden_size].
-            mu (tensor): [batch_size, seq_len, hidden_size].
-            eta (tensor): [batch_size, seq_len, hidden_size].
-            gamma (tensor): [batch_size, seq_len, hidden_size].
-            duration_t (tensor): [batch_size, seq_len, num_sample].
-
-        Returns:
-            tensor: hidden states at event times.
-        """
-
-        #print(encode_state.shape, duration_t.shape, 'two shape!!')
-
-        states = self.mu(encode_state[:,:-1]) + (
-            # self.eta(encode_state[:,:-1]) - self.mu(encode_state[:,:-1])) * torch.exp(
-            self.eta(encode_state[:,:-1]) - self.mu(encode_state[:,:-1])) * F.softplus(
-         -self.gamma(encode_state[:,:-1]) * duration_t[:,1:])
-
-        return states
-
-    def forward(self, event_type, event_time, time_gap, opt):
-        """Call the model
-
-        Args:
-            time_seqs (tensor): [batch_size, seq_len], timestamp seqs.
-            time_delta_seqs (tensor): [batch_size, seq_len], inter-event time seqs.
-            event_seqs (tensor): [batch_size, seq_len], event type seqs.
-            attention_mask (tensor): [batch_size, seq_len, hidden_size], attention masks.
-
-        Returns:
-            tensor: hidden states at event times.
-        """
-
-        slf_attn_mask_subseq = get_subsequent_mask(event_type)
-        slf_attn_mask_keypad = get_attn_key_pad_mask(seq_k=event_type, seq_q=event_type)
-        slf_attn_mask_keypad = slf_attn_mask_keypad.type_as(slf_attn_mask_subseq)
-        slf_attn_mask = (slf_attn_mask_keypad + slf_attn_mask_subseq).gt(0) 
-        non_pad_mask = get_non_pad_mask(event_type)
-
-        time_gap = torch.cat((torch.zeros_like(event_time[:,0:1]), (event_time[:,1:] - event_time[:,:-1])*non_pad_mask[:,1:].squeeze(-1)),axis=-1)
-
-        type_embedding = self.layer_type_emb(event_type)
-
-        enc_output = type_embedding + self.layer_position_emb(event_time, time_gap)
-        enc_output = self.encoder(
-                enc_output,
-                enc_output,
-                mask=slf_attn_mask
-                )
-        
-        # [batch_size, seq_len-1, hidden_dim]
-        cell_t = self.state_decay(encode_state=enc_output[:,:],
-                            duration_t=time_gap[:, :, None])
-
-        # [batch_size, seq_len-1, num_types]
-        lambda_at_event = self.softplus(cell_t)
-
-        # print(lambda_at_event.shape, 'the lambda at event, should be [batch_size, *, num_types]')
-
-        # [batch_size, seq_len, hidden_dim]
-        type_mask = 0
-        for type_ in range(1, self.num_types+1):
-            type_i_mask = (event_type[:,:] == type_).unsqueeze(-1)
-            if type_==1:
-                type_mask = type_i_mask
-            else:
-                type_mask = torch.cat((type_mask, type_i_mask), axis=-1)
-
-        assert lambda_at_event.shape[1] == cell_t.shape[1] == event_time.shape[1]-1 == time_gap.shape[1]-1
-
-        # Compute the big lambda integral in equation (8) of NHP paper
-        # 1 - take num_mc_sample rand points in each event interval
-        # 2 - compute its lambda value for every sample point
-        # 3 - take average of these sample points
-        # 4 - times the interval length
-
-        # [batch_size, seq - 1, num_sample, event_num]
-        sample_dtimes = self.make_dtime_loss_samples(time_gap)
-
-        # print(sample_dtimes.shape, 'the sampled duration shape, should be [batch_size, seq_len, num_sample]')
-
-        # 2.2 compute intensities at sampled times
-        # [batch_size, num_times = max_len - 1, num_sample, event_num]
-        state_t_sample = self.compute_states_at_sample_times(encode_state=enc_output, sample_dtimes=sample_dtimes)
-        lambda_t_sample = self.softplus(state_t_sample)
-
-        # print(lambda_at_event.shape, 'event inten!')
-        # print(lambda_t_sample.shape, 'non-event inten!')
-        
-
-        non_pad_mask = non_pad_mask.squeeze(-1).bool()
-
-        assert lambda_at_event.shape[1] == lambda_t_sample.shape[1] == time_gap.shape[1]-1 == non_pad_mask.shape[1]-1 == type_mask.shape[1]-1
-        event_ll, non_event_ll, num_events = self.compute_loglikelihood(lambda_at_event=lambda_at_event,
-                                                                        lambdas_loss_samples=lambda_t_sample,
-                                                                        time_delta_seq=time_gap[:, 1:],
-                                                                        seq_mask=non_pad_mask[:, 1:],
-                                                                        lambda_type_mask=type_mask[:, 1:])
-
-        # return enc_inten to compute accuracy
-        log_likelihood = (event_ll - non_event_ll).sum()
-
-        return -log_likelihood/num_events, enc_output
-
-    def make_dtime_loss_samples(self, time_delta_seq):
-        """Generate the time point samples for every interval.
-
-        Args:
-            time_delta_seq (tensor): [batch_size, seq_len].
-
-        Returns:
-            tensor: [batch_size, seq_len, n_samples]
-        """
-        # [1, 1, n_samples]
-        dtimes_ratio_sampled = torch.linspace(start=0.0,
-                                              end=1.0,
-                                              steps=20)[None, None, :].to('cuda')
-
-        # [batch_size, max_len, n_samples]
-        sampled_dtimes = time_delta_seq[:, :, None] * dtimes_ratio_sampled
-
-        return sampled_dtimes
-
-
-    def compute_states_at_sample_times(self,
-                                       encode_state,
-                                       sample_dtimes):
-        """Compute the hidden states at sampled times.
-
-        Args:
-            encode_state (tensor): three tensors with each shape [batch_size, seq_len, hidden_size].
-            sample_dtimes (tensor): [batch_size, seq_len, num_samples].
-
-        Returns:
-            tensor: [batch_size, seq_len, num_samples, hidden_size]， hidden state at each sampled time.
-        """
-        
-        # cell_states = self.state_decay(encode_state[:, :, None, :],
-        #                                sample_dtimes[:, :, :, None])
-
-        cell_states = self.mu(encode_state[:,:-1, None, :]) + (
-            # self.eta(encode_state[:,:-1, None, :]) - self.mu(encode_state[:,:-1, None, :])) * torch.exp(
-            self.eta(encode_state[:,:-1, None, :]) - self.mu(encode_state[:,:-1, None, :])) * F.softplus(
-         -self.gamma(encode_state[:,:-1, None, :]) * sample_dtimes[:,1:,:,None])
-
-        return cell_states
-
-    def compute_loglikelihood(self, time_delta_seq, lambda_at_event, lambdas_loss_samples, seq_mask,
-                              lambda_type_mask):
-        """Compute the loglikelihood of the event sequence based on Equation (8) of NHP paper.
-
-        Args:
-            time_delta_seq (tensor): [batch_size, seq_len], time_delta_seq from model input.
-            lambda_at_event (tensor): [batch_size, seq_len, num_event_types], unmasked intensity at
-            (right after) the event.
-            lambdas_loss_samples (tensor): [batch_size, seq_len, num_sample, num_event_types],
-            intensity at sampling times.
-            seq_mask (tensor): [batch_size, seq_len], sequence mask vector to mask the padded events.
-            lambda_type_mask (tensor): [batch_size, seq_len, num_event_types], type mask matrix to mask the
-            padded event types.
-
-        Returns:
-            tuple: event loglike, non-event loglike, intensity at event with padding events masked
-        """
-
-        # Sum of lambda over every type and every event point
-        # [batch_size, seq_len]
-        event_lambdas = torch.sum(lambda_at_event * lambda_type_mask, dim=-1) + self.eps
-        # mask the pad event
-        event_lambdas = event_lambdas.masked_fill_(~seq_mask, 1.0)
-
-        # [batch_size, seq_len)
-        event_ll = torch.log(event_lambdas)
-        # [batch_size, seq_len, n_loss_sample]
-
-        lambdas_total_samples = lambdas_loss_samples.sum(dim=-1)
-
-        # interval_integral - [batch_size, seq_len]
-        # interval_integral = length_interval * average of sampled lambda(t)
-        non_event_ll = lambdas_total_samples.mean(dim=-1) * time_delta_seq * seq_mask
-
-        num_events = torch.masked_select(event_ll, event_ll.ne(0.0)).size()[0]
-
-        return event_ll, non_event_ll, num_events
-
-    def predict(self, event_type, event_time, time_gap, opt):
-        """
-        Return the hidden representations and predictions.
-        For a sequence (l_1, l_2, ..., l_N), we predict (l_2, ..., l_N, l_{N+1}).
-        Input: event_type: batch*seq_len;
-               event_time: batch*seq_len.
-        Output: enc_output: batch*seq_len*model_dim;
-                type_prediction: batch*seq_len*num_classes (not normalized);
-                time_prediction: batch*seq_len.
-        """
-
-        intensity_pred = self.compute_intensity([event_type, event_time,time_gap], opt)
-        # intensity_pred = torch.stack(list(intensity_pred.values()), dim=-1).squeeze(2)[:,1:]
-        _, type_pred  = torch.max(intensity_pred, dim=-1)
-
-        return type_pred + 1
-    
 
 
 
@@ -741,6 +423,7 @@ class SAHP(nn.Module):
         CELoss = -(type_intensity + 1e-10).log() + (sum_intensity + 1e-10).log()
 
         loss = (0.5 * (score - noise_score) ** 2 * non_pad_mask[:,1:,:]).sum(-1) / num_noise
+        # loss *= var_noise ** 2
         loss += alpha * CELoss * non_pad_mask[:,1:].squeeze(-1)
 
         return loss
@@ -954,80 +637,4 @@ class SAHP(nn.Module):
         return score, score_grad
     
 
-    def score_manual(self, event_type, event_time, time_gap):
-        slf_attn_mask_subseq = get_subsequent_mask(event_type)
-        slf_attn_mask_keypad = get_attn_key_pad_mask(seq_k=event_type, seq_q=event_type)
-        slf_attn_mask_keypad = slf_attn_mask_keypad.type_as(slf_attn_mask_subseq)
-        slf_attn_mask = (slf_attn_mask_keypad + slf_attn_mask_subseq).gt(0) 
-        non_pad_mask = get_non_pad_mask(event_type)
-
-        time_gap = torch.cat((torch.zeros_like(event_time[:,0:1]), (event_time[:,1:] - event_time[:,:-1])*non_pad_mask[:,1:].squeeze(-1)),axis=-1)
-
-        type_embedding = self.layer_type_emb(event_type)
-
-        enc_output = type_embedding + self.layer_position_emb(event_time, time_gap)
-        enc_output = self.encoder(
-                enc_output,
-                enc_output,
-                mask=slf_attn_mask
-                )
-        
-        self.enc_output = enc_output
-
-        time_gap = torch.cat((torch.zeros_like(event_time[:,0:1]), (event_time[:,1:] - event_time[:,:-1])*non_pad_mask[:,1:].squeeze(-1)),axis=-1)
-        t_var = torch.autograd.Variable(time_gap, requires_grad=True)
-
-        mu_matrix = self.mu(enc_output[:,:-1])
-        eta_matrix = self.eta(enc_output[:,:-1])
-        gamma_matrix = self.gamma(enc_output[:,:-1])
-
-        self.mu_matrix = mu_matrix
-        self.eta_matrix = eta_matrix
-        self.gamma_matrix = gamma_matrix
-        # non_pad_mask = non_pad_mask.squeeze(-1)
-
-        state_decay = mu_matrix + (eta_matrix - mu_matrix)* torch.exp(-gamma_matrix * t_var[:, 1:, None])
-        ds_dt = (eta_matrix - mu_matrix) * ( -gamma_matrix) * torch.exp(-gamma_matrix * t[:, 1:, None])
-        d2s_dt2 = (eta_matrix - mu_matrix) * (gamma_matrix**2) * torch.exp(-gamma_matrix * t[:, 1:, None])
-
-        dlambda_dt = ((1 - 1/(1+torch.exp(state_decay))) * ds_dt).sum(-1)
-        d2lambda_dt2 = ((1 - 1/(1+torch.exp(state_decay))) * d2s_dt2 + ds_dt**2 * (1/(1+torch.exp(state_decay)) - 1/(1+torch.exp(state_decay))**2)).sum(-1)
-
-        all_intensity = torch.log(1 + torch.exp(state_decay)) * non_pad_mask[:,1:]
-        sum_intensity = all_intensity.sum(-1)
-        # all_intensity = self.my_softplus(state_decay) * non_pad_mask[:,1:]
-
-        score = 1/(sum_intensity + 1e-10) * dlambda_dt *non_pad_mask[:,1:].squeeze(-1) - sum_intensity *non_pad_mask[:,1:].squeeze(-1)
-        score_grad = - 1/(sum_intensity + 1e-10)**2 * dlambda_dt ** 2 * non_pad_mask[:,1:].squeeze(-1) + d2lambda_dt2 / (sum_intensity + 1e-10) * non_pad_mask[:,1:].squeeze(-1) - dlambda_dt * non_pad_mask[:,1:].squeeze(-1)
-
-        return score, score_grad
-
-    def my_softplus(self, x):
-        return torch.where(x > 80, x, torch.log(1 + torch.exp(x)))
-
-
-
-    def packed_score_manual(self, t, event_type, event_time, time_gap, non_pad_mask):
-        
-        enc_output = self.enc_output
-        mu_matrix = self.mu(enc_output[:,:-1])
-        eta_matrix = self.eta(enc_output[:,:-1])
-        gamma_matrix = self.gamma(enc_output[:,:-1])
-        
-        state_decay = self.state_decay(encode_state=self.enc_output[:,:],
-                            duration_t=t[:, :, None])
-
-        ds_dt = (eta_matrix - mu_matrix) * ( -gamma_matrix) * torch.exp(-gamma_matrix * t[:, 1:, None])
-        d2s_dt2 = (eta_matrix - mu_matrix) * (gamma_matrix**2) * torch.exp(-gamma_matrix * t[:, 1:, None])
-
-        dlambda_dt = ((1 - 1/(1+torch.exp(state_decay))) * ds_dt).sum(-1)
-        d2lambda_dt2 = ((1 - 1/(1+torch.exp(state_decay))) * d2s_dt2 + ds_dt**2 * (1/(1+torch.exp(state_decay)) - 1/(1+torch.exp(state_decay))**2)).sum(-1)
-
-        all_intensity = torch.log(1 + torch.exp(state_decay)) * non_pad_mask[:,1:]
-        sum_intensity = all_intensity.sum(-1)
-        # all_intensity = self.my_softplus(state_decay) * non_pad_mask[:,1:]
-
-        score = 1/(sum_intensity + 1e-10) * dlambda_dt *non_pad_mask[:,1:].squeeze(-1) - sum_intensity *non_pad_mask[:,1:].squeeze(-1)
-        score_grad = - 1/(sum_intensity + 1e-10)**2 * dlambda_dt ** 2 * non_pad_mask[:,1:].squeeze(-1) + d2lambda_dt2 / (sum_intensity + 1e-10) * non_pad_mask[:,1:].squeeze(-1) - dlambda_dt * non_pad_mask[:,1:].squeeze(-1)
-
-        return all_intensity, score, score_grad
+    
