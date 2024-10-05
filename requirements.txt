@@ -1,0 +1,12 @@
+absl-py==1.4.0
+numpy==1.23.5
+numpydoc==1.7.0
+nvidia-cublas-cu11==11.10.3.66
+pickle5==0.0.11
+pillow==10.4.0
+scipy==1.10.1
+seaborn==0.13.0
+tensorflow==2.12.0
+torch==2.0.1
+torchvision==0.15.2
+tqdm==4.65.0
