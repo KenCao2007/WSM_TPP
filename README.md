@@ -1,6 +1,6 @@
 # Weighted Score Matching for Temporal Point Processes
 
-Code for manuscript 'Weighted Score Matching for Temporal Point Processes', submitted
+Code for Is Score Matching Suitable for Estimating Point Processes? NeurIPS 2024
 
 ## Dependencies:
 * Use python==3.8
@@ -12,7 +12,7 @@ Code for manuscript 'Weighted Score Matching for Temporal Point Processes', subm
 * Use commend like `bash sahp_hs_wsm.sh` to run an experiment. The results will be saved in `results` folder.
 * We also provide the trained models and validation results for Table 2 in a google drive folder [here](https://drive.google.com/drive/folders/1NuWup6mbrmKYfxZ92fBDrX2erpQp-2rx?usp=sharing).
 
-## Citation:
+## Reference:
 Please cite the following paper if you use this code.
 ```
 
