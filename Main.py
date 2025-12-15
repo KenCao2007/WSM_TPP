@@ -6,8 +6,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from Utils import eval_loglikelihood, eval_accuracy 
-import matplotlib.pyplot as plt
+from Utils import eval_loglikelihood
 from preprocess.Dataset import get_dataloader
 from transformer.THP import thp_Transformer, get_non_pad_mask
 from tqdm import tqdm
@@ -36,9 +35,71 @@ def prepare_dataloader(opt):
     logging.info('Loading test data...')
     test_data, _ = load_data(opt.data + 'test.pkl', 'test')
 
+
+    min_event_time = min([ item['time_since_start'] for data in train_data + dev_data +test_data for item in data])
+    max_event_time = max([ item['time_since_start'] for data in train_data + dev_data +test_data for item in data])
+
+    if opt.data_name in ['half-sin_multivariate', 'exp_decay','conditional_logistic']:
+        min_event_time = 0.0
+        max_event_time = 1.0
+
+    # normalize the event time
+    if opt.normalize_time:
+        for i in range(len(train_data)):
+            for j in range(len(train_data[i])):
+                train_data[i][j]['time_since_start'] = (train_data[i][j]['time_since_start'] - min_event_time) / (max_event_time - min_event_time) * opt.normalize_scale
+                train_data[i][j]['time_since_last_event']  = (train_data[i][j]['time_since_last_event']) / (max_event_time - min_event_time) * opt.normalize_scale
+            train_data[i][0]['time_since_last_event'] = train_data[i][0]['time_since_start']  # set the first event's time_since_last_event
+            if opt.data_name not in ['taxi']:
+                train_data[i].insert(0, {'time_since_start': 0.0, 'time_since_last_event': 0.0, 'type_event': 0})
+        for i in range(len(dev_data)):
+            for j in range(len(dev_data[i])):
+                dev_data[i][j]['time_since_start'] = (dev_data[i][j]['time_since_start'] - min_event_time) / (max_event_time - min_event_time) * opt.normalize_scale
+                dev_data[i][j]['time_since_last_event'] = (dev_data[i][j]['time_since_last_event']) / (max_event_time - min_event_time) * opt.normalize_scale
+            dev_data[i][0]['time_since_last_event'] = dev_data[i][0]['time_since_start']  # set the first event's time_since_last_event
+            if opt.data_name not in ['taxi']:
+                dev_data[i].insert(0, {'time_since_start': 0.0, 'time_since_last_event': 0.0, 'type_event': 0})
+        for i in range(len(test_data)):
+            for j in range(len(test_data[i])):
+                test_data[i][j]['time_since_start'] = (test_data[i][j]['time_since_start'] - min_event_time) / (max_event_time - min_event_time) * opt.normalize_scale
+                test_data[i][j]['time_since_last_event'] = (test_data[i][j]['time_since_last_event']) / (max_event_time - min_event_time) * opt.normalize_scale
+            test_data[i][0]['time_since_last_event'] = test_data[i][0]['time_since_start']  # set the first event's time_since_last_event
+            if opt.data_name not in ['taxi']:
+                test_data[i].insert(0, {'time_since_start': 0.0, 'time_since_last_event': 0.0, 'type_event': 0})
+
+    
+    if opt.data_name in ['retweet','taobao','stackoverflow','taxi']:
+        # for each list in data[i], we minus data[i][0]['time_since_start'] for each time, and drop the first element
+        for i in range(len(train_data)):
+            for j in range(1,len(train_data[i])):
+                train_data[i][j]['time_since_start'] -= train_data[i][0]['time_since_start']
+            train_data[i][0]['time_since_start'] = 0.
+        for i in range(len(dev_data)):
+            for j in range(1,len(dev_data[i])):
+                dev_data[i][j]['time_since_start'] -= dev_data[i][0]['time_since_start']
+            dev_data[i][0]['time_since_start'] = 0.
+        for i in range(len(test_data)):
+            for j in range(1,len(test_data[i])):
+                test_data[i][j]['time_since_start'] -= test_data[i][0]['time_since_start']
+            test_data[i][0]['time_since_start'] = 0.
+            
+    elif opt.data_name in ['half-sin_multivariate', 'exp_decay','conditional_logistic']:
+        for i in range(len(train_data)):
+            # insert 0 at the beginning of the list
+            train_data[i].insert(0, {'time_since_start': 0.0, 'time_since_last_event': 0.0, 'type_event': 1})
+        for i in range(len(dev_data)):
+            dev_data[i].insert(0, {'time_since_start': 0.0, 'time_since_last_event': 0.0, 'type_event': 0})
+        for i in range(len(test_data)):
+            test_data[i].insert(0, {'time_since_start': 0.0, 'time_since_last_event': 0.0, 'type_event': 0})
+
+    # get maximum event time in all data
+    max_event_time = max([ item['time_since_start'] for data in train_data + dev_data +test_data for item in data])
+    logging.info('Maximum event time: {}'.format(max_event_time))
+    opt.max_event_time = max_event_time
+    
     trainloader = get_dataloader(train_data, opt.batch_size, shuffle=True)
     testloader = get_dataloader(test_data, opt.batch_size, shuffle=False)
-    return trainloader, testloader, num_types
+    return trainloader, testloader, num_types, max_event_time
 
 
 def train_epoch(model, training_data, optimizer, pred_loss_func, opt):
@@ -66,7 +127,7 @@ def train_epoch(model, training_data, optimizer, pred_loss_func, opt):
         num_preds = torch.tensor(non_pad_mask.shape[0]) * 1.0
 
         loss_, _ = model(event_type, event_time, time_gap, opt)
-        loss = loss_.sum()#/num_preds
+        loss = loss_.sum()
         total_loss+=loss.item()
         total_preds+=torch.sum(num_preds)
 
@@ -143,9 +204,9 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-data', type=str, default="data/stackoverflow/")
+    parser.add_argument('-data', type=str, default="conditional_logistic", choices=[ "half-sin_multivariate","stackoverflow", "retweet", "taobao", "taxi", "exp_decay","conditional_logistic"])
 
-    parser.add_argument('-epoch', type=int, default=100)
+    parser.add_argument('-epoch', type=int, default=500)
     parser.add_argument('-batch_size', type=int, default=64)
 
     parser.add_argument('-d_model', type=int, default=16)
@@ -158,46 +219,43 @@ def main():
 
     parser.add_argument('-dropout', type=float, default=0.1)
     parser.add_argument('-lr', type=float, default=1e-3)
-    parser.add_argument('-smooth', type=float, default=0.1)
 
     parser.add_argument('-log', type=str, default='log.txt')
-
     parser.add_argument('-mode', type=str, default='intensity') # score matching mode: build by intensity or model score directly
     parser.add_argument('-method', type=str, choices=["wsm","mle","dsm"], default='wsm')
-    parser.add_argument('-T_per_batch', type=bool, default=True) # T are set to be the maximum event time at each batch.
-    parser.add_argument('-model', type=str, choices=['thp_transformer', "ithp_transformer", "sahp"], default='thp_transformer')
+    parser.add_argument('-model', type=str, choices=['thp_transformer', "sahp"], default='thp_transformer')
     parser.add_argument('-train_able', type=int, default=1)
     parser.add_argument('-load_model', type=int, default=0)
-    parser.add_argument('-num_grid', type=int, default=1)
-    parser.add_argument('-CE_coef', type=float, default=1.0)
+    parser.add_argument('-num_grid', type=int, default=5)
+    parser.add_argument('-CE_coef', type=float, default=10.0, help="weight for label cross entropy loss")
+    parser.add_argument('-alpha_survival', type = float, default=50.0, help="weight for survival loss")
+    parser.add_argument('-alpha_neg', type=float, default=50., help='negative class weight for survival loss')
     parser.add_argument('-h_type', type=str, default="two_side_op", choices=['None','two_side_op','two_side_ord','one_side_ord','one_side_opt'])
-    parser.add_argument('-noise_var', type=float, default=1.0)
-    parser.add_argument('-num_noise', type=int, default=1)
-    parser.add_argument('-seq_trunc', type=int, default=0)
-    parser.add_argument('-delete_outlier', type=int, default=0)
-    parser.add_argument('-inconsistent_T', type=int, default=0)
-    parser.add_argument('-seed', type=int, default=0)
+    parser.add_argument('-noise_var', type=float, default=0.5)
+    parser.add_argument('-num_noise', type=int, default=50)
+    parser.add_argument('-seed', type=int, default=4)
+    parser.add_argument('-normalize_time', type=int, default=0)
+    parser.add_argument('-normalize_scale', type=float, default=1.0, help="scale for time normalization")
+    parser.add_argument('-noise_type', type=str, default='lognormal', choices=['normal', 'lognormal'])
+    parser.add_argument('-with_survival', type=int, default=1)
+    parser.add_argument('-with_tll_on_img', type=int, default=0)
+
+   
    
 
     opt = parser.parse_args()
+    opt.data = f"data/{opt.data}/"
     # default device is CUDA
     opt.device = torch.device('cuda')
     
-    # opt.data = "data/stackoverflow/"
-    # opt.data = "data/earthquake/"
-    # opt.data = "data/retweet/"
-    # opt.data = "data/hawkes/"
-    # opt.data = "data/taobao/"
-    # opt.data = "data/half-sin_multivariate/"
-
     opt.data_name = opt.data.split('/')[-2]
 
     if opt.method == "mle":
-        opt.model_saved_name = f'/{opt.model}_{opt.method}_numgrid{opt.num_grid}_{opt.data_name}_epoch{opt.epoch}_{opt.seed}'
+        opt.model_saved_name = f'/{opt.model}_{opt.method}_numgrid{opt.num_grid}_{opt.data_name}_{opt.with_survival}_epoch{opt.epoch}_{opt.seed}'
     elif opt.method == "wsm":
-        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.h_type}_alpha{opt.CE_coef}_epoch{opt.epoch}_{opt.seed}'
+        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.with_survival}_alpha{opt.CE_coef}_epoch{opt.epoch}_{opt.seed}'
     elif opt.method == "dsm":
-        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_alpha{opt.CE_coef}_noise{opt.noise_var}_num{opt.num_noise}_epoch{opt.epoch}_{opt.seed}'
+        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.with_survival}_alpha{opt.CE_coef}_noise{opt.noise_var}_num{opt.num_noise}_epoch{opt.epoch}_{opt.seed}'
     opt.results_saved_path = 'results{dir_name}'.format(dir_name=opt.model_saved_name) # IMPORTANT: save model, logging, plots here
     if not os.path.exists(opt.results_saved_path):
         os.makedirs(opt.results_saved_path)
@@ -213,7 +271,7 @@ def main():
     """ prepare dataloader """
     torch.manual_seed(opt.seed)
     np.random.seed(opt.seed)
-    trainloader, testloader, num_types = prepare_dataloader(opt)
+    trainloader, testloader, num_types, max_time = prepare_dataloader(opt)
     opt.num_types =num_types
     """ prepare model """
 
@@ -227,12 +285,13 @@ def main():
             d_k=opt.d_k,
             d_v=opt.d_v,
             dropout=opt.dropout,
-            opt = opt
+            opt = opt,
+            max_time = max_time
         )
         for param in model.parameters():
             param.data = param.data.double()
     elif opt.model == "sahp":
-        model = SAHP(model_config=opt)
+        model = SAHP(model_config=opt, max_time=max_time)
         for param in model.parameters():
             param.data = param.data.double()
 
@@ -255,17 +314,23 @@ def main():
 
     if opt.load_model:
         model.load_state_dict(torch.load(opt.results_saved_path + opt.model_saved_name + '.pth'))
+        # model.load_state_dict(torch.load('results/sahp_wsm_taxi_1_alpha10.0_epoch250_1/sahp_wsm_taxi_1_alpha10.0_epoch250_1.pth'))
         logging.info("loading models from {}".format(opt.results_saved_path + opt.model_saved_name + '.pth'))
     """ train the model """
 
     if opt.train_able:
-        train(model, trainloader, testloader, optimizer, scheduler, pred_loss_func, opt)
+            train(model, trainloader, testloader, optimizer, scheduler, pred_loss_func, opt)
     
 
     opt.train_able=False
     model.load_state_dict(torch.load(opt.results_saved_path + opt.model_saved_name + '.pth'))
     tll = Utils.eval_loglikelihood(model, testloader, opt)
     acc = Utils.eval_accuracy(model, testloader, opt)
+
+    if not opt.with_tll_on_img:
+        Utils.eval_intensity(model, testloader, opt)
+    else:
+        Utils.eval_intensity(model, testloader, opt, tll)
     logging.info("The testing tll and accuracy are {} and {}".format(tll, acc))
 
     
