@@ -110,6 +110,7 @@ def train_epoch(model, training_data, optimizer, pred_loss_func, opt):
     
     total_loss = 0
     total_preds = 0
+    total_grad_norm = 0
     idx = 0
     for batch in tqdm(training_data, mininterval=2,
                       desc='  - (Training)   ', leave=False):
@@ -132,9 +133,11 @@ def train_epoch(model, training_data, optimizer, pred_loss_func, opt):
         total_preds+=torch.sum(num_preds)
 
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.max_grad_norm)
+        total_grad_norm += grad_norm.item()
         """ update parameters """
         optimizer.step()
-    return total_loss, total_preds
+    return total_loss, total_preds, total_grad_norm / idx
 
 
 
@@ -155,10 +158,11 @@ def train(model, training_data, validation_data, optimizer, scheduler, pred_loss
         logging.info('[ Epoch {}]'.format(epoch))
     
         start = time.time()
-        total_loss, total_preds = train_epoch(model, training_data, optimizer, pred_loss_func, opt)
+        total_loss, total_preds, avg_grad_norm = train_epoch(model, training_data, optimizer, pred_loss_func, opt)
         logging.info('  - (Training)    objective function: {ll: 8.5f}, '
+              'avg grad norm: {gn: 8.5f}, '
               'elapse: {elapse:3.3f} min'
-              .format(ll=total_loss/total_preds, elapse=(time.time() - start) / 60))
+              .format(ll=total_loss/total_preds, gn=avg_grad_norm, elapse=(time.time() - start) / 60))
 
         tr_loss.append(total_loss/total_preds.cpu().numpy())
 
@@ -239,6 +243,7 @@ def main():
     parser.add_argument('-noise_type', type=str, default='lognormal', choices=['normal', 'lognormal'])
     parser.add_argument('-with_survival', type=int, default=1)
     parser.add_argument('-with_tll_on_img', type=int, default=0)
+    parser.add_argument('-max_grad_norm', type=float, default=float('inf'), help="max gradient norm for clipping; inf means no clipping")
 
    
    
@@ -265,6 +270,8 @@ def main():
                                     level=logging.DEBUG, filemode='w')
     logging.getLogger().addHandler(logging.StreamHandler()) # show on console
     logging.getLogger('matplotlib.font_manager').disabled = True # disable matplotlib logging
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
 
     logging.info('parameters: {}'.format(opt))
 
