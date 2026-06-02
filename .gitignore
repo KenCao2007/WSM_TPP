@@ -1,0 +1,9 @@
+results/
+data/
+__pycache__/
+*.pth
+*.pkl
+*.pdf
+scripts/logs/
+preprocess/__pycache__/
+transformer/__pycache__/

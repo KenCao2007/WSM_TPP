@@ -255,12 +255,13 @@ def main():
     
     opt.data_name = opt.data.split('/')[-2]
 
+    clip_tag = f'_clip{int(opt.max_grad_norm)}' if opt.max_grad_norm != float('inf') else ''
     if opt.method == "mle":
-        opt.model_saved_name = f'/{opt.model}_{opt.method}_numgrid{opt.num_grid}_{opt.data_name}_{opt.with_survival}_epoch{opt.epoch}_{opt.seed}'
+        opt.model_saved_name = f'/{opt.model}_{opt.method}_numgrid{opt.num_grid}_{opt.data_name}_{opt.with_survival}_epoch{opt.epoch}_{opt.seed}{clip_tag}'
     elif opt.method == "wsm":
-        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.with_survival}_alpha{opt.CE_coef}_epoch{opt.epoch}_{opt.seed}'
+        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.with_survival}_alpha{opt.CE_coef}_epoch{opt.epoch}_{opt.seed}{clip_tag}'
     elif opt.method == "dsm":
-        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.with_survival}_alpha{opt.CE_coef}_noise{opt.noise_var}_num{opt.num_noise}_epoch{opt.epoch}_{opt.seed}'
+        opt.model_saved_name = f'/{opt.model}_{opt.method}_{opt.data_name}_{opt.with_survival}_alpha{opt.CE_coef}_noise{opt.noise_var}_num{opt.num_noise}_epoch{opt.epoch}_{opt.seed}{clip_tag}'
     opt.results_saved_path = 'results{dir_name}'.format(dir_name=opt.model_saved_name) # IMPORTANT: save model, logging, plots here
     if not os.path.exists(opt.results_saved_path):
         os.makedirs(opt.results_saved_path)
